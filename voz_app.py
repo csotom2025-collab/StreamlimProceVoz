@@ -259,7 +259,7 @@ if uploaded_file is not None:
     colours = st.sidebar.selectbox('Elige la paleta de colores', named_colorscales, index=default_ix)
     dynamic_range = st.sidebar.slider('Rango Dinámico (dB)', 1, 100, 70)
     window_length = st.sidebar.slider('Longitud de ventana (s)', 0.001, 1.0, 1.0/128, step=0.001)
-    n_mfcc = st.sidebar.slider('Número de coeficientes MFCC', 12, 40, 12)
+    n_mfcc = st.sidebar.slider('Número de coeficientes MFCC (DCT)', 12, 40, 12)
     n_filtros = st.sidebar.slider('Número de filtros Mel', 10, 40, 29)
     st.header("Espectrogramas")
     
