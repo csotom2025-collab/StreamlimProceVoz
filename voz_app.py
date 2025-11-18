@@ -1,12 +1,64 @@
 import streamlit as st
 import numpy as np
 from scipy.fftpack import dct
-from scipy.signal import get_window
+from scipy.signal import get_window, resample_poly
+from fractions import Fraction
+from scipy.io import wavfile
 import plotly.graph_objs as go
 import plotly.express as px
 import os
 import parselmouth
 
+# C:/Users/usuario/Desktop/StreamlimProceVoz/.venv/Scripts/streamlit.exe run voz_app.py 
+
+def cargaAudio(path, sr=None, mono=True, dtype=np.float32, resample_limit_denominator=1000):
+    """
+    Leer WAV con scipy y comportarse como librosa.load:
+    - devuelve (y, sr)
+    - y es float32 normalizado en [-1, 1]
+    - opcionalmente mezcla a mono (mono=True)
+    - opcionalmente re-muestrea a sr (si sr is not None)
+    """
+    try:
+        sr_orig, data = wavfile.read(path)
+    except Exception as e:
+        st.error(f"Error leyendo archivo WAV: {str(e)}")
+        return None, None
+
+    # Convertir a float32 y normalizar si viene en enteros
+    if np.issubdtype(data.dtype, np.integer):
+        iinfo = np.iinfo(data.dtype)
+        # dividir por el valor máximo positivo (igual que librosa/soundfile en la práctica)
+        data = data.astype(np.float32) / float(iinfo.max)
+    else:
+        data = data.astype(np.float32)
+
+    # Mezclar a mono si se requiere
+    if mono and data.ndim > 1:
+        # librosa hace una mezcla promediando canales
+        data = np.mean(data, axis=1)
+
+    # Re-muestrear si se pide una sr distinta
+    if sr is not None and sr != sr_orig:
+        # Obtener fracción racional aproximada sr/sr_orig para resample_poly
+        frac = Fraction(sr, sr_orig).limit_denominator(resample_limit_denominator)
+        up, down = frac.numerator, frac.denominator
+        # resample_poly espera 1D arrays; si multi-canal, habría que procesar por canal
+        if data.ndim > 1:
+            # aplicar por canal
+            chans = []
+            for c in range(data.shape[1]):
+                chans.append(resample_poly(data[:, c], up, down))
+            data = np.stack(chans, axis=1)
+        else:
+            data = resample_poly(data, up, down)
+        out_sr = sr
+    else:
+        out_sr = sr_orig
+
+    # Forzar dtype de salida
+    data = data.astype(dtype, copy=False)
+    return data, out_sr
 
 st.title("Espectrograma de Mel modificado")
 st.write("¡Bienvenido! Por favor, sube tu archivo de audio.")
@@ -23,54 +75,52 @@ if uploaded_file is not None:
 else:
     st.warning("Por favor, sube un archivo de audio (.wav)")
 
-
-
 def preenfasis(signal, pre_emphasis_coeff=0.97):
     """Aplica un filtro de preénfasis a la señal de audio."""
     emphasized_signal = np.append(signal[0], signal[1:] - pre_emphasis_coeff * signal[:-1])
     return emphasized_signal
 
 def segmentacion(audio, frame_size, hop_size, sample_rate=None):
-        """
-        Divide la señal en frames usando el mismo método que HTK.
-        Args:
-            audio: señal de audio
-            frame_size: tamaño del frame en muestras
-            hop_size: salto entre frames en muestras
-            sample_rate: frecuencia de muestreo (opcional, no usado)
-        Returns:
-            frames: matriz de frames
-        """
-        # Calcular número de frames como HTK
-        signal_length = len(audio)
-        num_frames = int(np.ceil(float(signal_length - frame_size + hop_size) / hop_size))
+    """
+    Divide la señal en frames usando el mismo método que HTK.
+    Args:
+        audio: señal de audio
+        frame_size: tamaño del frame en muestras
+        hop_size: salto entre frames en muestras
+        sample_rate: frecuencia de muestreo (opcional, no usado)
+    Returns:
+        frames: matriz de frames
+    """
+    # Calcular número de frames como HTK
+    signal_length = len(audio)
+    num_frames = int(np.ceil(float(signal_length - frame_size + hop_size) / hop_size))
+    
+    # Crear matriz de frames con padding si es necesario
+    pad_length = (num_frames - 1) * hop_size + frame_size
+    if pad_length > signal_length:
+        pad_signal = np.append(audio, np.zeros(pad_length - signal_length))
+    else:
+        pad_signal = audio
         
-        # Crear matriz de frames con padding si es necesario
-        pad_length = (num_frames - 1) * hop_size + frame_size
-        if pad_length > signal_length:
-            pad_signal = np.append(audio, np.zeros(pad_length - signal_length))
-        else:
-            pad_signal = audio
-            
-        frames = np.zeros((num_frames, frame_size))
-        for i in range(num_frames):
-            start = i * hop_size
-            frames[i] = pad_signal[start:start + frame_size]
-            
-        return frames
+    frames = np.zeros((num_frames, frame_size))
+    for i in range(num_frames):
+        start = i * hop_size
+        frames[i] = pad_signal[start:start + frame_size]
+        
+    return frames
 
 def ventaneo(signal, frame_size, hop_size, window_type='hamming'):
-        """Divide la señal en frames con ventana aplicada."""
-        num_frames = 1 + int((len(signal) - frame_size) / hop_size)
-        frames = np.zeros((num_frames, frame_size))
-        window = get_window(window_type, frame_size, fftbins=True)
-        for i in range(num_frames):
-            start = i * hop_size
-            frames[i] = signal[start:start + frame_size] * window
-        return frames
+    """Divide la señal en frames con ventana aplicada."""
+    num_frames = 1 + int((len(signal) - frame_size) / hop_size)
+    frames = np.zeros((num_frames, frame_size))
+    window = get_window(window_type, frame_size, fftbins=True)
+    for i in range(num_frames):
+        start = i * hop_size
+        frames[i] = signal[start:start + frame_size] * window
+    return frames
 
 def met_to_freq(mels):
-        return 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
+    return 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
 
 def freq_to_mel(freq):
     return 2595.0 * np.log10(1.0 + freq / 700.0)
@@ -78,7 +128,7 @@ def freq_to_mel(freq):
 def Melk(k, fres):
     return 1127.0 * np.log(1.0 + (k - 1) * fres)
 
-def calcular_mfcc(data, fs, n_mfcc=12, win_len=0.025, hop_len=0.01):
+def calcular_mfcc(data, fs, n_mfcc=12, win_len=0.025, hop_len=0.01, n_filt=29):
     """
     Calcula los coeficientes MFCC de una señal de audio sin librerías externas.
     Args:
@@ -87,6 +137,7 @@ def calcular_mfcc(data, fs, n_mfcc=12, win_len=0.025, hop_len=0.01):
         n_mfcc: número de coeficientes MFCC (por defecto 12 como HTK)
         win_len: longitud de ventana en segundos (por defecto 25ms como HTK)
         hop_len: salto entre ventanas en segundos (por defecto 10ms como HTK)
+        n_filt: número de filtros Mel (por defecto 29 como HTK)
     Returns:
         mfccs: matriz de coeficientes MFCC (ventanas x coeficientes)
         t_mfcc: vector de tiempo de cada ventana
@@ -108,7 +159,7 @@ def calcular_mfcc(data, fs, n_mfcc=12, win_len=0.025, hop_len=0.01):
     # 5. Crear y aplicar filtros Mel
     low_freq_mel = freq_to_mel(0)
     high_freq_mel = freq_to_mel(fs/2)
-    n_filt = 29  # Como HTK
+    # USAR EL PARÁMETRO n_filt EN LUGAR DEL VALOR FIJO 29
     mel_points = np.linspace(low_freq_mel, high_freq_mel, n_filt + 2)
     hz_points = met_to_freq(mel_points)
     bin_points = np.floor((NFFT + 1) * hz_points / fs).astype(int)
@@ -128,35 +179,16 @@ def calcular_mfcc(data, fs, n_mfcc=12, win_len=0.025, hop_len=0.01):
     # Convertir a dB y manejar valores pequeños
     filter_banks = np.where(filter_banks <= 0, np.finfo(float).eps, filter_banks)
     filter_banks = 20 * np.log10(filter_banks)
-
     # 6. Coeficientes DCT para obtener MFCC (sin transponer)
     mfccs = dct(filter_banks, type=2, axis=1, norm='ortho')[:, :n_mfcc]
-    # 7. Aplicar la función Melk para el cálculo de los filtros de Mel
-
-    n_filters = 40  # Número de filtros en la escala de Mel
-    fres = fs / n_filters  # Resolución en frecuencia
-    mel_filters = np.zeros((n_filters, int(win_len * fs)))
-
-    # Crear la matriz de filtros de Mel usando la función Melk
-    for k in range(1, n_filters + 1):
-        mel_filters[k - 1] = Melk(k, fres)  # Calcula los valores Mel para cada filtro
-
-    # Aplicar los filtros de Mel a la señal
-    filter_banks = np.dot(mel_filters, frames.T)  # Multiplicación matricial para aplicar los filtros
-
-    # 8. Calcular los coeficientes MFCC mediante DCT
-    mfccs = dct(np.log(filter_banks), type=2, axis=0, norm='ortho')[:n_mfcc]
-
-    # 9. Calcular el vector de tiempo para los MFCC
-    t_mfcc = np.arange(0, len(mfccs)) * hop_len
-
-    # Imprimir información de debug
-    print('##############MFCC Custom calculated###############')
-    print('MFCC Custom shape:', mfccs.shape)
-    print('MFCC Custom (frames):\n', mfccs)
-    print('Filter Banks Custom shape:', filter_banks.shape)
-    print('Filter Banks Custom (frames):\n', filter_banks)
-
+    # 7. Tiempo de cada ventana
+    t_mfcc = np.arange(len(mfccs)) * hop_len
+    
+    # Mostrar información de depuración
+    print(f'############## MFCC con {n_filt} filtros ###############')
+    print(f'MFCC shape: {mfccs.shape}')
+    print(f'Filter Banks shape: {filter_banks.shape}')
+    
     return mfccs, t_mfcc, filter_banks
 
 def draw_spectrogram(spectrogram, vmin, vmax):
@@ -199,35 +231,72 @@ def plot_mfcc_spectrogram(mfccs, t_mfcc, filter_banks, colours):
     )
     st.plotly_chart(fig_mfcc)
 
-
 if uploaded_file is not None:
     # Side Bar #######################################################
-    sound = parselmouth.Sound("temp_audio.wav")
-    signal = sound.values[0]  # Obtener los valores del audio
-    fs = sound.sampling_frequency  # Obtener la frecuencia de muestreo
+    st.sidebar.header("Configuración de Análisis")
+    
+    # Opción para usar cargaAudio o parselmouth
+    use_custom_loader = st.sidebar.checkbox("Usar cargador personalizado", value=False)
+    
+    if use_custom_loader:
+        # Usar nuestra función cargaAudio
+        signal, fs = cargaAudio("temp_audio.wav")
+        if signal is None:
+            st.error("Error al cargar el audio con el cargador personalizado")
+            st.stop()
+    else:
+        # Usar parselmouth (comportamiento original)
+        sound = parselmouth.Sound("temp_audio.wav")
+        signal = sound.values[0]  # Obtener los valores del audio
+        fs = sound.sampling_frequency  # Obtener la frecuencia de muestreo
     
     nyquist_frequency = int(fs/2)
-    maximum_frequency = st.sidebar.slider('Frecuencia máxima (Hz)', 5000, nyquist_frequency, 5500)
-
+    maximum_frequency = st.sidebar.slider('Frecuencia máxima (Hz)', 1, nyquist_frequency, nyquist_frequency)
+    
+    
     named_colorscales = px.colors.named_colorscales()
     default_ix = named_colorscales.index('turbo')
-    colours = st.sidebar.selectbox(('Elige la paleta de colores'), named_colorscales, index=default_ix)
-    dynamic_range = st.sidebar.slider('Rango Dinámico (dB)', 10, 100, 75)
-    window_length = st.sidebar.slider('Longitud de ventana (s)', 0.005, 0.05, 0.05)
+    colours = st.sidebar.selectbox('Elige la paleta de colores', named_colorscales, index=default_ix)
+    dynamic_range = st.sidebar.slider('Rango Dinámico (dB)', 1, 100, 70)
+    window_length = st.sidebar.slider('Longitud de ventana (s)', 0.001, 1.0, 1.0/128, step=0.001)
     n_mfcc = st.sidebar.slider('Número de coeficientes MFCC', 12, 40, 12)
-
+    n_filtros = st.sidebar.slider('Número de filtros Mel', 10, 40, 29)
     st.header("Espectrogramas")
     
-    # Mostrar espectrograma tradicional
-    spectrogram = sound.to_spectrogram(window_length=window_length, maximum_frequency=maximum_frequency)
-    sg_db = 10 * np.log10(spectrogram.values)
-    vmin = sg_db.max() - dynamic_range
-    vmax = sg_db.max()
-    draw_spectrogram(spectrogram, vmin, vmax)
+    # Mostrar información del audio cargado
+    st.subheader("Información del Audio")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Frecuencia de muestreo", f"{fs} Hz")
+    with col2:
+        st.metric("Duración", f"{len(signal)/fs:.2f} s")
+    with col3:
+        st.metric("Muestras", f"{len(signal)}")
+    
+    # Mostrar espectrograma tradicional (solo si usamos parselmouth)
+    if not use_custom_loader:
+        st.subheader("Espectrograma con Parselmouth")
+        spectrogram = sound.to_spectrogram(window_length=window_length, maximum_frequency=maximum_frequency)
+        sg_db = 10 * np.log10(spectrogram.values)
+        vmin = sg_db.max() - dynamic_range
+        vmax = sg_db.max()
+        draw_spectrogram(spectrogram, vmin, vmax)
+    else:
+        st.info("Usando cargador personalizado - Espectrograma Praat no disponible")
 
     # Calcular y mostrar MFCC y filter banks
-    mfccs, t_mfcc, filter_banks = calcular_mfcc(signal, fs, n_mfcc=n_mfcc, 
+    st.subheader("Análisis MFCC Personalizado")
+    mfccs, t_mfcc, filter_banks = calcular_mfcc(signal, fs=maximum_frequency, n_mfcc=n_mfcc, 
                                                win_len=window_length, 
-                                               hop_len=window_length/4)
+                                               hop_len=window_length/4,
+                                               n_filt=n_filtros)
     
     plot_mfcc_spectrogram(mfccs, t_mfcc, filter_banks, colours)
+    
+    # Mostrar información adicional sobre los MFCC
+    st.subheader("Información de MFCC")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Número de frames MFCC", len(mfccs))
+    with col2:
+        st.metric("Shape de MFCC", str(mfccs.shape))
